@@ -6,13 +6,8 @@ import whisper
 import subprocess
 from datetime import datetime
 from pathlib import Path
-import logging
 import tempfile
 import shutil
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 class VideoTranscriber:
     def __init__(self, model_size="large", hf_token=None):
@@ -20,10 +15,10 @@ class VideoTranscriber:
         Initialize the video transcriber
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {self.device}")
+        print(f"Using device: {self.device}", flush=True)
 
         # Load Whisper model
-        logger.info(f"Loading Whisper model: {model_size}")
+        print(f"Loading Whisper model: {model_size}", flush=True)
         self.model = whisper.load_model(model_size, device=self.device)
 
         self.hf_token = hf_token
@@ -36,14 +31,14 @@ class VideoTranscriber:
                 from whisperx import load_align_model, align
                 from whisperx.diarize import assign_word_speakers
 
-                logger.info("Initializing speaker diarization pipeline")
+                print("Initializing speaker diarization pipeline", flush=True)
                 self.diarization_pipeline = DiarizationPipeline(use_auth_token=hf_token)
                 self.load_align_model = load_align_model
                 self.align = align
                 self.assign_word_speakers = assign_word_speakers
 
             except Exception as e:
-                logger.warning(f"WhisperX not available: {e}. Speaker diarization disabled.")
+                print(f"WhisperX not available: {e}. Speaker diarization disabled.", flush=True)
                 self.diarization_pipeline = None
 
     def extract_audio(self, video_path, audio_path):
@@ -61,17 +56,17 @@ class VideoTranscriber:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             return True
         except Exception as e:
-            logger.error(f"FFmpeg failed to extract audio: {e}")
+            print(f"FFmpeg failed to extract audio: {e}", flush=True)
             return False
 
     def transcribe_audio(self, audio_path):
         """Transcribe audio using Whisper"""
         try:
-            logger.info(f"Transcribing: {audio_path}")
-            result = self.model.transcribe(audio_path)
+            print(f"Transcribing: {audio_path}", flush=True)
+            result = self.model.transcribe(audio_path, verbose=True)
             return result
         except Exception as e:
-            logger.error(f"Failed to transcribe {audio_path}: {e}")
+            print(f"Failed to transcribe {audio_path}: {e}", flush=True)
             return None
 
     def perform_diarization(self, audio_path, script):
@@ -80,7 +75,7 @@ class VideoTranscriber:
             return None
 
         try:
-            logger.info("Performing speaker diarization...")
+            print("Performing speaker diarization...", flush=True)
             diarized = self.diarization_pipeline(audio_path)
 
             model_a, metadata = self.load_align_model(
@@ -111,12 +106,12 @@ class VideoTranscriber:
             return transcribed_segments
 
         except Exception as e:
-            logger.error(f"Speaker diarization failed: {e}")
+            print(f"Speaker diarization failed: {e}", flush=True)
             return None
 
     def process_video(self, video_path):
         """Process a single video file"""
-        logger.info(f"Processing: {video_path}")
+        print(f"Processing: {video_path}", flush=True)
 
         video_name = Path(video_path).stem
         tmp_dir = tempfile.mkdtemp()
@@ -152,10 +147,10 @@ class VideoTranscriber:
                     result["speaker_segments"] = speaker_segments
 
             result["success"] = True
-            logger.info(f"Successfully processed: {video_name}")
+            print(f"Successfully processed: {video_name}", flush=True)
 
         except Exception as e:
-            logger.error(f"Error processing {video_path}: {e}")
+            print(f"Error processing {video_path}: {e}", flush=True)
             result["error"] = str(e)
 
         finally:
@@ -175,15 +170,15 @@ def process_video_folder(folder_path, output_json, model_size="large", hf_token=
         video_files.extend(glob.glob(os.path.join(folder_path, extension)))
         video_files.extend(glob.glob(os.path.join(folder_path, extension.upper())))
 
-    logger.info(f"Found {len(video_files)} video files")
+    print(f"Found {len(video_files)} video files", flush=True)
 
     if not video_files:
-        logger.warning(f"No video files found in {folder_path}")
+        print(f"No video files found in {folder_path}", flush=True)
         return
 
     results = []
     for i, video_path in enumerate(video_files, 1):
-        logger.info(f"Processing video {i}/{len(video_files)}: {os.path.basename(video_path)}")
+        print(f"Processing video {i}/{len(video_files)}: {os.path.basename(video_path)}", flush=True)
 
         result = transcriber.process_video(video_path)
         results.append(result)
@@ -198,10 +193,10 @@ def process_video_folder(folder_path, output_json, model_size="large", hf_token=
                 "results": results
             }, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"Progress saved: {i}/{len(video_files)} completed")
+        print(f"Progress saved: {i}/{len(video_files)} completed", flush=True)
 
     successful = sum(1 for r in results if r["success"])
-    logger.info(f"Successfully processed: {successful}/{len(video_files)} videos")
+    print(f"Successfully processed: {successful}/{len(video_files)} videos", flush=True)
 
 if __name__ == "__main__":
     import argparse
@@ -224,14 +219,14 @@ if __name__ == "__main__":
     hf_token = args.token or os.getenv('HF_TOKEN')
 
     if not os.path.exists(args.folder_path):
-        logger.error(f"Folder not found: {args.folder_path}")
+        print(f"Folder not found: {args.folder_path}", flush=True)
         raise SystemExit(1)
 
-    logger.info(f"Starting batch transcription:")
-    logger.info(f"  Folder: {args.folder_path}")
-    logger.info(f"  Output: {args.output}")
-    logger.info(f"  Model: {args.model}")
-    logger.info(f"  Speaker diarization: {'Enabled' if hf_token else 'Disabled'}")
+    print("Starting batch transcription:", flush=True)
+    print(f"  Folder: {args.folder_path}", flush=True)
+    print(f"  Output: {args.output}", flush=True)
+    print(f"  Model: {args.model}", flush=True)
+    print(f"  Speaker diarization: {'Enabled' if hf_token else 'Disabled'}", flush=True)
 
     process_video_folder(
         folder_path=args.folder_path,
