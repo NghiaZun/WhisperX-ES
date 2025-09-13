@@ -18,7 +18,7 @@ class VideoTranscriberX:
         print(f"Using device: {self.device}", flush=True)
 
         # Load WhisperX model
-        compute_type = "float32" if self.device == "cpu" else "float16"
+        compute_type = "float32"
         print(f"Loading WhisperX model: {model_size}", flush=True)
         self.model = whisperx.load_model(model_size, device=self.device, compute_type=compute_type)
 
