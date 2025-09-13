@@ -1,0 +1,20 @@
+# Core dependencies
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Whisper for transcription
+openai-whisper>=20231117
+
+# Video/Audio processing
+moviepy>=1.0.3
+librosa>=0.10.0
+
+# WhisperX for speaker diarization (optional)
+git+https://github.com/m-bain/whisperX.git
+
+# Additional audio processing
+ffmpeg-python>=0.2.0
+
+# Utilities
+pathlib
+argparse
