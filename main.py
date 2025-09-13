@@ -17,7 +17,12 @@ class VideoTranscriberX:
         print(f"Using device: {self.device}", flush=True)
 
         print(f"Loading WhisperX model: {model_size}", flush=True)
-        self.model = whisperx.load_model(model_size, self.device)
+        # Fix: dùng float32 thay vì float16
+        self.model = whisperx.load_model(
+            model_size,
+            self.device,
+            compute_type="float32"
+        )
 
         self.hf_token = hf_token
         self.diarization_pipeline = None
@@ -35,6 +40,7 @@ class VideoTranscriberX:
                 )
             except Exception as e:
                 print(f"WhisperX diarization not available: {e}", flush=True)
+
 
     def extract_audio(self, video_path, audio_path):
         """Extract audio from video using ffmpeg"""
