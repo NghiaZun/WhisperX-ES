@@ -1,48 +1,43 @@
 import os
 import json
 import glob
-import torch
-import whisper
 import subprocess
-from datetime import datetime
-from pathlib import Path
 import tempfile
 import shutil
+from datetime import datetime
+from pathlib import Path
 
-class VideoTranscriber:
-    def __init__(self, model_size="large", hf_token=None):
-        """
-        Initialize the video transcriber
-        """
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import torch
+import whisperx
+
+
+class VideoTranscriberX:
+    def __init__(self, model_size="large-v2", hf_token=None):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}", flush=True)
 
-        # Load Whisper model
-        print(f"Loading Whisper model: {model_size}", flush=True)
-        self.model = whisper.load_model(model_size, device=self.device)
+        print(f"Loading WhisperX model: {model_size}", flush=True)
+        self.model = whisperx.load_model(model_size, self.device)
 
         self.hf_token = hf_token
         self.diarization_pipeline = None
+        self.align_model = None
+        self.align_metadata = None
 
-        # Initialize speaker diarization if token provided
         if hf_token:
             try:
-                from whisperx.diarize import DiarizationPipeline
-                from whisperx import load_align_model, align
-                from whisperx.diarize import assign_word_speakers
-
-                print("Initializing speaker diarization pipeline", flush=True)
-                self.diarization_pipeline = DiarizationPipeline(use_auth_token=hf_token)
-                self.load_align_model = load_align_model
-                self.align = align
-                self.assign_word_speakers = assign_word_speakers
-
+                print("Loading alignment + diarization models...", flush=True)
+                self.align_model, self.align_metadata = whisperx.load_align_model(
+                    language_code="en", device=self.device
+                )
+                self.diarization_pipeline = whisperx.DiarizationPipeline(
+                    use_auth_token=hf_token, device=self.device
+                )
             except Exception as e:
-                print(f"WhisperX not available: {e}. Speaker diarization disabled.", flush=True)
-                self.diarization_pipeline = None
+                print(f"WhisperX diarization not available: {e}", flush=True)
 
     def extract_audio(self, video_path, audio_path):
-        """Extract audio from video using ffmpeg (safe, no ALSA dependency)"""
+        """Extract audio from video using ffmpeg"""
         try:
             cmd = [
                 "ffmpeg", "-y",
@@ -56,62 +51,38 @@ class VideoTranscriber:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             return True
         except Exception as e:
-            print(f"FFmpeg failed to extract audio: {e}", flush=True)
+            print(f"FFmpeg failed: {e}", flush=True)
             return False
 
     def transcribe_audio(self, audio_path):
-        """Transcribe audio using Whisper"""
+        """Transcribe + align + diarize using WhisperX"""
         try:
             print(f"Transcribing: {audio_path}", flush=True)
-            result = self.model.transcribe(audio_path, verbose=True)
+            audio = whisperx.load_audio(audio_path)
+            result = self.model.transcribe(audio)
+
+            # Align
+            if self.align_model is not None:
+                result = whisperx.align(
+                    result["segments"],
+                    self.align_model,
+                    self.align_metadata,
+                    audio_path,
+                    self.device
+                )
+
+            # Diarization
+            if self.diarization_pipeline is not None:
+                diarize_segments = self.diarization_pipeline(audio_path)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+
             return result
         except Exception as e:
-            print(f"Failed to transcribe {audio_path}: {e}", flush=True)
-            return None
-
-    def perform_diarization(self, audio_path, script):
-        """Perform speaker diarization if available"""
-        if not self.diarization_pipeline:
-            return None
-
-        try:
-            print("Performing speaker diarization...", flush=True)
-            diarized = self.diarization_pipeline(audio_path)
-
-            model_a, metadata = self.load_align_model(
-                language_code=script["language"],
-                device=self.device
-            )
-            script_aligned = self.align(
-                script["segments"],
-                model_a,
-                metadata,
-                audio_path,
-                self.device
-            )
-
-            result_segments, word_seg = list(self.assign_word_speakers(
-                diarized, script_aligned
-            ).values())
-
-            transcribed_segments = []
-            for segment in result_segments:
-                transcribed_segments.append({
-                    "start": segment.get("start"),
-                    "end": segment.get("end"),
-                    "text": segment.get("text"),
-                    "speaker": segment.get("speaker")
-                })
-
-            return transcribed_segments
-
-        except Exception as e:
-            print(f"Speaker diarization failed: {e}", flush=True)
+            print(f"Failed to transcribe: {e}", flush=True)
             return None
 
     def process_video(self, video_path):
-        """Process a single video file"""
-        print(f"Processing: {video_path}", flush=True)
+        print(f"Processing video: {video_path}", flush=True)
 
         video_name = Path(video_path).stem
         tmp_dir = tempfile.mkdtemp()
@@ -123,115 +94,70 @@ class VideoTranscriber:
             "processed_at": datetime.now().isoformat(),
             "success": False,
             "error": None,
-            "transcription": None,
-            "segments": None,
-            "speaker_segments": None
+            "transcription": None
         }
 
         try:
             if not self.extract_audio(video_path, audio_path):
-                result["error"] = "Failed to extract audio"
+                result["error"] = "Audio extraction failed"
                 return result
 
             script = self.transcribe_audio(audio_path)
             if not script:
-                result["error"] = "Failed to transcribe audio"
+                result["error"] = "Transcription failed"
                 return result
 
-            result["transcription"] = script.get("text", "")
-            result["segments"] = script.get("segments", [])
-
-            if self.diarization_pipeline:
-                speaker_segments = self.perform_diarization(audio_path, script)
-                if speaker_segments:
-                    result["speaker_segments"] = speaker_segments
-
+            result["transcription"] = script
             result["success"] = True
-            print(f"Successfully processed: {video_name}", flush=True)
+            print(f"Done: {video_name}", flush=True)
 
         except Exception as e:
-            print(f"Error processing {video_path}: {e}", flush=True)
             result["error"] = str(e)
+            print(f"Error: {e}", flush=True)
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return result
 
-def process_video_folder(folder_path, output_json, model_size="large", hf_token=None,
-                        video_extensions=None):
-    if video_extensions is None:
-        video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.wmv', '*.flv', '*.webm']
 
-    transcriber = VideoTranscriber(model_size=model_size, hf_token=hf_token)
+def process_video_folder(folder_path, output_json, model_size="large-v2", hf_token=None):
+    transcriber = VideoTranscriberX(model_size=model_size, hf_token=hf_token)
 
+    video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.wmv', '*.flv', '*.webm']
     video_files = []
-    for extension in video_extensions:
-        video_files.extend(glob.glob(os.path.join(folder_path, extension)))
-        video_files.extend(glob.glob(os.path.join(folder_path, extension.upper())))
+    for ext in video_extensions:
+        video_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        video_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
 
-    print(f"Found {len(video_files)} video files", flush=True)
-
-    if not video_files:
-        print(f"No video files found in {folder_path}", flush=True)
-        return
+    print(f"Found {len(video_files)} videos", flush=True)
 
     results = []
     for i, video_path in enumerate(video_files, 1):
-        print(f"Processing video {i}/{len(video_files)}: {os.path.basename(video_path)}", flush=True)
-
+        print(f"--- [{i}/{len(video_files)}] ---", flush=True)
         result = transcriber.process_video(video_path)
         results.append(result)
 
-        with open(output_json, 'w', encoding='utf-8') as f:
-            json.dump({
-                "processed_at": datetime.now().isoformat(),
-                "total_videos": len(video_files),
-                "processed_videos": i,
-                "model_size": model_size,
-                "speaker_diarization_enabled": hf_token is not None,
-                "results": results
-            }, f, indent=2, ensure_ascii=False)
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
 
-        print(f"Progress saved: {i}/{len(video_files)} completed", flush=True)
+    print(f"Saved results to {output_json}", flush=True)
 
-    successful = sum(1 for r in results if r["success"])
-    print(f"Successfully processed: {successful}/{len(video_files)} videos", flush=True)
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description='Batch video transcription with speaker diarization')
-    parser.add_argument('folder_path', help='Path to folder containing videos')
-    parser.add_argument('-o', '--output', default='transcription_results.json',
-                       help='Output JSON file path')
-    parser.add_argument('-m', '--model', default='large',
-                       choices=['tiny', 'base', 'small', 'medium', 'large'],
-                       help='Whisper model size')
-    parser.add_argument('-t', '--token', default=None,
-                       help='Hugging Face token for speaker diarization (optional)')
-    parser.add_argument('-e', '--extensions', nargs='+',
-                       default=['*.mp4', '*.avi', '*.mov', '*.mkv', '*.wmv', '*.flv', '*.webm'],
-                       help='Video file extensions to process')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("folder_path", help="Path to folder with videos")
+    parser.add_argument("-o", "--output", default="results.json", help="Output JSON file")
+    parser.add_argument("-m", "--model", default="large-v2", help="WhisperX model size")
+    parser.add_argument("-t", "--token", default=None, help="HuggingFace token for diarization")
     args = parser.parse_args()
 
-    hf_token = args.token or os.getenv('HF_TOKEN')
-
-    if not os.path.exists(args.folder_path):
-        print(f"Folder not found: {args.folder_path}", flush=True)
-        raise SystemExit(1)
-
-    print("Starting batch transcription:", flush=True)
-    print(f"  Folder: {args.folder_path}", flush=True)
-    print(f"  Output: {args.output}", flush=True)
-    print(f"  Model: {args.model}", flush=True)
-    print(f"  Speaker diarization: {'Enabled' if hf_token else 'Disabled'}", flush=True)
+    hf_token = args.token or os.getenv("HF_TOKEN")
 
     process_video_folder(
         folder_path=args.folder_path,
         output_json=args.output,
         model_size=args.model,
-        hf_token=hf_token,
-        video_extensions=args.extensions
+        hf_token=hf_token
     )
