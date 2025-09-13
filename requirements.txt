@@ -1,26 +1,23 @@
-# Core dependencies
+# Core dependencies - specific versions for compatibility
 torch>=2.0.0
 torchaudio>=2.0.0
 
-# NumPy compatibility fix
-numpy<2.0
-
 # Whisper for transcription
-openai-whisper>=20231117
+openai-whisper==20231117
 
-# Video/Audio processing
-moviepy>=1.0.3
-librosa>=0.10.0
+# Video/Audio processing - compatible versions
+moviepy==1.0.3
+librosa==0.10.0
 
-# WhisperX for speaker diarization (optional)
-git+https://github.com/m-bain/whisperX.git
+# NumPy - find middle ground
+numpy>=1.20.3,<2.0
+
+# WhisperX - use older compatible version
+# git+https://github.com/m-bain/whisperX.git@v3.1.1
 
 # Additional audio processing
-ffmpeg-python>=0.2.0
+ffmpeg-python==0.2.0
 
-# Fix matplotlib compatibility
-matplotlib>=3.7.0
-
-# Utilities
-pathlib
-argparse
+# Basic utilities (built-in, no need to install)
+# pathlib
+# argparse
