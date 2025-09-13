@@ -3,11 +3,9 @@ import json
 import glob
 import torch
 import whisper
-import librosa
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_audio
-from moviepy.editor import VideoFileClip
 import logging
 import tempfile
 import shutil
@@ -49,21 +47,22 @@ class VideoTranscriber:
                 self.diarization_pipeline = None
 
     def extract_audio(self, video_path, audio_path):
-        """Extract audio from video file"""
+        """Extract audio from video using ffmpeg (safe, no ALSA dependency)"""
         try:
-            # Try with moviepy
-            video = VideoFileClip(video_path)
-            video.audio.write_audiofile(audio_path, verbose=False, logger=None)
-            video.close()
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                audio_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             return True
         except Exception as e:
-            logger.warning(f"Moviepy failed, fallback to ffmpeg: {e}")
-            try:
-                ffmpeg_extract_audio(video_path, audio_path)
-                return True
-            except Exception as e2:
-                logger.error(f"FFmpeg also failed to extract audio: {e2}")
-                return False
+            logger.error(f"FFmpeg failed to extract audio: {e}")
+            return False
 
     def transcribe_audio(self, audio_path):
         """Transcribe audio using Whisper"""
@@ -120,7 +119,8 @@ class VideoTranscriber:
         logger.info(f"Processing: {video_path}")
 
         video_name = Path(video_path).stem
-        audio_path = f"temp_{video_name}.wav"
+        tmp_dir = tempfile.mkdtemp()
+        audio_path = os.path.join(tmp_dir, f"{video_name}.wav")
 
         result = {
             "video_path": str(video_path),
@@ -159,11 +159,7 @@ class VideoTranscriber:
             result["error"] = str(e)
 
         finally:
-            if os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                except:
-                    pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return result
 
