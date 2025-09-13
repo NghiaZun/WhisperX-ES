@@ -2,6 +2,9 @@
 torch>=2.0.0
 torchaudio>=2.0.0
 
+# NumPy compatibility fix
+numpy<2.0
+
 # Whisper for transcription
 openai-whisper>=20231117
 
@@ -14,6 +17,9 @@ git+https://github.com/m-bain/whisperX.git
 
 # Additional audio processing
 ffmpeg-python>=0.2.0
+
+# Fix matplotlib compatibility
+matplotlib>=3.7.0
 
 # Utilities
 pathlib
