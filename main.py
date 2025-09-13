@@ -58,23 +58,31 @@ class VideoTranscriberX:
         """Transcribe + align + diarize using WhisperX"""
         try:
             print(f"Transcribing: {audio_path}", flush=True)
-            audio = whisperx.load_audio(audio_path)
-            result = self.model.transcribe(audio)
+
+            # Use path directly to avoid numpy/tensor issues
+            result = self.model.transcribe(audio_path)
 
             # Align
             if self.align_model is not None:
-                result = whisperx.align(
-                    result["segments"],
-                    self.align_model,
-                    self.align_metadata,
-                    audio_path,
-                    self.device
-                )
+                try:
+                    result = whisperx.align(
+                        result["segments"],
+                        self.align_model,
+                        self.align_metadata,
+                        audio_path,
+                        self.device
+                    )
+                except Exception as e:
+                    print(f"Alignment failed: {e}", flush=True)
 
             # Diarization
             if self.diarization_pipeline is not None:
-                diarize_segments = self.diarization_pipeline(audio_path)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
+                try:
+                    diarize_segments = self.diarization_pipeline(audio_path)
+                    if diarize_segments:
+                        result = whisperx.assign_word_speakers(diarize_segments, result)
+                except Exception as e:
+                    print(f"Diarization failed: {e}", flush=True)
 
             return result
         except Exception as e:
@@ -126,20 +134,23 @@ def process_video_folder(folder_path, output_json, model_size="large-v2", hf_tok
 
     video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.wmv', '*.flv', '*.webm']
     video_files = []
+
+    folder_path = Path(folder_path)
     for ext in video_extensions:
-        video_files.extend(glob.glob(os.path.join(folder_path, ext)))
-        video_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+        video_files.extend(folder_path.rglob(ext))
+        video_files.extend(folder_path.rglob(ext.upper()))
 
     print(f"Found {len(video_files)} videos", flush=True)
 
     results = []
     for i, video_path in enumerate(video_files, 1):
         print(f"--- [{i}/{len(video_files)}] ---", flush=True)
-        result = transcriber.process_video(video_path)
+        result = transcriber.process_video(str(video_path))
         results.append(result)
 
-        with open(output_json, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+    # Save all results at once
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
 
     print(f"Saved results to {output_json}", flush=True)
 
