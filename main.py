@@ -85,9 +85,27 @@ class VideoTranscriberX:
             if 'gpu_free' in memory_info:
                 print(f"Initial memory - GPU: {memory_info['gpu_free']:.1f}GB free", flush=True)
 
-        # Load WhisperX model
-        compute_type = "float32" if self.device == "cpu" else "float16"
-        print(f"Loading WhisperX model: {model_size}", flush=True)
+        # Load WhisperX model with P100 compatibility
+        if self.device == "cpu":
+            compute_type = "float32"
+        else:
+            # Check GPU compute capability for float16 support
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                compute_capability = torch.cuda.get_device_capability(0)
+                
+                # P100 has compute capability 6.0, supports float16 but not efficiently
+                # Use float32 for P100 and older cards
+                if "P100" in gpu_name or compute_capability[0] < 7:
+                    compute_type = "float32"
+                    print(f"Using float32 for {gpu_name} (compute capability {compute_capability})", flush=True)
+                else:
+                    compute_type = "float16"
+                    print(f"Using float16 for {gpu_name} (compute capability {compute_capability})", flush=True)
+            else:
+                compute_type = "float32"
+        
+        print(f"Loading WhisperX model: {model_size} with {compute_type}", flush=True)
         self.model = whisperx.load_model(model_size, device=self.device, compute_type=compute_type)
 
         # HuggingFace token
