@@ -132,7 +132,7 @@ class MultiGPUVideoTranscriberX:
             print(f"Loading model on {device}...", flush=True)
             
             # Load WhisperX model
-            model = whisperx.load_model("large", device="cpu")
+            model = whisperx.load_model("large", device="cpu",  compute_type="int8")
 
             
             # Initialize transcriber config
