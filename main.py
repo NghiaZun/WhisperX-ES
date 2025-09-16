@@ -8,8 +8,12 @@ from datetime import datetime
 from pathlib import Path
 import subprocess
 from typing import Optional, Dict, Any, List
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 
 import torch
+import torch.multiprocessing as mp
 import whisperx
 from pyannote.audio import Pipeline
 from tqdm import tqdm
@@ -19,7 +23,7 @@ class MemoryManager:
     """Quản lý memory cho GPU và CPU"""
     
     @staticmethod
-    def get_memory_info():
+    def get_memory_info(device_id=None):
         """Lấy thông tin memory hiện tại"""
         memory_info = {
             'cpu_percent': psutil.virtual_memory().percent,
@@ -27,21 +31,37 @@ class MemoryManager:
         }
         
         if torch.cuda.is_available():
-            memory_info.update({
-                'gpu_allocated': torch.cuda.memory_allocated() / (1024**3),  # GB
-                'gpu_cached': torch.cuda.memory_reserved() / (1024**3),  # GB
-                'gpu_free': (torch.cuda.get_device_properties(0).total_memory - 
-                           torch.cuda.memory_allocated()) / (1024**3)  # GB
-            })
+            if device_id is not None:
+                with torch.cuda.device(device_id):
+                    memory_info.update({
+                        f'gpu_{device_id}_allocated': torch.cuda.memory_allocated(device_id) / (1024**3),
+                        f'gpu_{device_id}_cached': torch.cuda.memory_reserved(device_id) / (1024**3),
+                        f'gpu_{device_id}_free': (torch.cuda.get_device_properties(device_id).total_memory - 
+                                               torch.cuda.memory_allocated(device_id)) / (1024**3)
+                    })
+            else:
+                # All GPUs info
+                for i in range(torch.cuda.device_count()):
+                    memory_info.update({
+                        f'gpu_{i}_allocated': torch.cuda.memory_allocated(i) / (1024**3),
+                        f'gpu_{i}_cached': torch.cuda.memory_reserved(i) / (1024**3),
+                        f'gpu_{i}_free': (torch.cuda.get_device_properties(i).total_memory - 
+                                        torch.cuda.memory_allocated(i)) / (1024**3)
+                    })
         
         return memory_info
     
     @staticmethod
-    def clear_gpu_cache():
+    def clear_gpu_cache(device_id=None):
         """Clear GPU cache"""
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            if device_id is not None:
+                with torch.cuda.device(device_id):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            else:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
     
     @staticmethod
     def clear_cpu_cache():
@@ -49,205 +69,244 @@ class MemoryManager:
         gc.collect()
     
     @staticmethod
-    def clear_all_cache():
+    def clear_all_cache(device_id=None):
         """Clear both GPU and CPU cache"""
-        MemoryManager.clear_gpu_cache()
+        MemoryManager.clear_gpu_cache(device_id)
         MemoryManager.clear_cpu_cache()
-    
-    @staticmethod
-    def should_clear_memory(threshold_gpu=0.8, threshold_cpu=0.85):
-        """Check if memory should be cleared"""
-        memory_info = MemoryManager.get_memory_info()
-        
-        if torch.cuda.is_available():
-            gpu_usage = memory_info['gpu_allocated'] / (memory_info['gpu_allocated'] + memory_info['gpu_free'])
-            if gpu_usage > threshold_gpu:
-                return True
-        
-        if memory_info['cpu_percent'] > threshold_cpu * 100:
-            return True
-        
-        return False
 
 
-class VideoTranscriberX:
-    def __init__(self, model_size="large-v2", hf_token=None, memory_management=True):
-        # Device
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+class MultiGPUVideoTranscriberX:
+    def __init__(self, model_size="large-v2", hf_token=None, memory_management=True, 
+                 language="auto", device_ids=None):
+        
         self.memory_management = memory_management
-        
-        print(f"Using device: {self.device}", flush=True)
-        
-        # Memory info
-        if self.memory_management:
-            memory_info = MemoryManager.get_memory_info()
-            print(f"Initial memory - CPU: {memory_info['cpu_percent']:.1f}%", flush=True)
-            if 'gpu_free' in memory_info:
-                print(f"Initial memory - GPU: {memory_info['gpu_free']:.1f}GB free", flush=True)
-
-        # Load WhisperX model with P100 compatibility
-        if self.device == "cpu":
-            compute_type = "float32"
-        else:
-            # Check GPU compute capability for float16 support
-            if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                compute_capability = torch.cuda.get_device_capability(0)
-                
-                # P100 has compute capability 6.0, supports float16 but not efficiently
-                # Use float32 for P100 and older cards
-                if "P100" in gpu_name or compute_capability[0] < 7:
-                    compute_type = "float32"
-                    print(f"Using float32 for {gpu_name} (compute capability {compute_capability})", flush=True)
-                else:
-                    compute_type = "float16"
-                    print(f"Using float16 for {gpu_name} (compute capability {compute_capability})", flush=True)
-            else:
-                compute_type = "float32"
-        
-        print(f"Loading WhisperX model: {model_size} with {compute_type}", flush=True)
-        self.model = whisperx.load_model(model_size, device=self.device, compute_type=compute_type)
-
-        # HuggingFace token
+        self.language = language
         self.hf_token = hf_token
-
-        # Load alignment model
-        self.align_model = None
-        self.align_metadata = None
-        try:
-            print("Loading alignment model...", flush=True)
-            self.align_model, self.align_metadata = whisperx.load_align_model(
-                language_code="en", device=self.device
+        self.model_size = model_size
+        
+        # Setup devices - T4x2 configuration
+        if device_ids is None:
+            if torch.cuda.is_available():
+                self.device_ids = list(range(torch.cuda.device_count()))
+                print(f"Auto-detected {len(self.device_ids)} GPUs: {self.device_ids}", flush=True)
+            else:
+                self.device_ids = ["cpu"]
+                print("No CUDA available, using CPU", flush=True)
+        else:
+            self.device_ids = device_ids
+        
+        # T4-specific optimizations
+        self.compute_type = "float16"  # T4 supports float16 efficiently
+        self.batch_size = 32  # T4 has 16GB memory, can handle larger batches
+        
+        # Print GPU info for T4x2
+        if torch.cuda.is_available():
+            for i in self.device_ids:
+                if isinstance(i, int):
+                    gpu_name = torch.cuda.get_device_name(i)
+                    gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    compute_cap = torch.cuda.get_device_capability(i)
+                    print(f"GPU {i}: {gpu_name}, Memory: {gpu_memory:.1f}GB, Compute: {compute_cap}", flush=True)
+        
+        # Initialize transcribers for each GPU
+        self.transcribers = {}
+        self.init_transcribers()
+        
+        # Thread-safe queue for load balancing
+        self.gpu_queue = queue.Queue()
+        for device_id in self.device_ids:
+            self.gpu_queue.put(device_id)
+    
+    def init_transcribers(self):
+        """Initialize one transcriber per GPU"""
+        print("Initializing transcribers on multiple GPUs...", flush=True)
+        
+        for device_id in self.device_ids:
+            if isinstance(device_id, int):  # GPU
+                device = f"cuda:{device_id}"
+                compute_type = self.compute_type
+            else:  # CPU
+                device = "cpu"
+                compute_type = "float32"
+            
+            print(f"Loading model on {device}...", flush=True)
+            
+            # Load WhisperX model
+            model = whisperx.load_model(
+                self.model_size, 
+                device=device, 
+                compute_type=compute_type
             )
+            
+            # Initialize transcriber config
+            transcriber_config = {
+                'model': model,
+                'device': device,
+                'device_id': device_id,
+                'align_model': None,
+                'align_metadata': None,
+                'detected_language': None,
+                'diarization_pipeline': None
+            }
+            
+            # Load diarization pipeline if token provided (only on first GPU to save memory)
+            if self.hf_token and device_id == self.device_ids[0]:
+                try:
+                    print(f"Loading diarization pipeline on {device}...", flush=True)
+                    transcriber_config['diarization_pipeline'] = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization",
+                        use_auth_token=self.hf_token
+                    ).to(device)
+                except Exception as e:
+                    print(f"Diarization not available on {device}: {e}", flush=True)
+            
+            self.transcribers[device_id] = transcriber_config
+            
+            if self.memory_management:
+                memory_info = MemoryManager.get_memory_info(device_id if isinstance(device_id, int) else None)
+                print(f"Memory after loading on {device}: {memory_info}", flush=True)
+
+    def load_alignment_model(self, device_id, language_code: str):
+        """Load alignment model cho ngôn ngữ cụ thể trên GPU cụ thể"""
+        transcriber = self.transcribers[device_id]
+        
+        if (transcriber['align_model'] is not None and 
+            transcriber['detected_language'] == language_code):
+            return  # Đã load rồi
+        
+        try:
+            device = transcriber['device']
+            print(f"Loading alignment model for {language_code} on {device}...", flush=True)
+            
+            # Language mapping
+            language_map = {
+                'vi': 'vi', 'zh': 'zh', 'ja': 'ja', 'ko': 'ko', 'th': 'th',
+                'en': 'en', 'fr': 'fr', 'de': 'de', 'es': 'es', 'it': 'it',
+                'pt': 'pt', 'ru': 'ru', 'ar': 'ar', 'hi': 'hi'
+            }
+            
+            mapped_lang = language_map.get(language_code, language_code)
+            
+            align_model, align_metadata = whisperx.load_align_model(
+                language_code=mapped_lang, 
+                device=device
+            )
+            
+            transcriber['align_model'] = align_model
+            transcriber['align_metadata'] = align_metadata
+            transcriber['detected_language'] = language_code
+            
+            print(f"Alignment model loaded successfully for {language_code} on {device}", flush=True)
+            
         except Exception as e:
-            print(f"Alignment model failed: {e}", flush=True)
+            print(f"Failed to load alignment model for {language_code} on {device}: {e}", flush=True)
+            transcriber['align_model'] = None
+            transcriber['align_metadata'] = None
 
-        # Load diarization pipeline if token provided
-        self.diarization_pipeline = None
-        if hf_token:
-            try:
-                print("Loading pyannote diarization pipeline...", flush=True)
-                self.diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization",
-                    use_auth_token=hf_token
-                )
-            except Exception as e:
-                print(f"Diarization not available: {e}", flush=True)
-
-        if self.memory_management:
-            memory_info = MemoryManager.get_memory_info()
-            print(f"After loading models - CPU: {memory_info['cpu_percent']:.1f}%", flush=True)
-            if 'gpu_allocated' in memory_info:
-                print(f"After loading models - GPU: {memory_info['gpu_allocated']:.1f}GB allocated", flush=True)
-
-    def extract_audio(self, video_path: str, audio_path: str, progress_callback=None) -> bool:
-        """Extract audio from video using ffmpeg with progress tracking"""
-        if not os.path.exists(video_path):
-            print(f"Video file not found: {video_path}", flush=True)
-            return False
-        
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-vn",
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            str(audio_path)
-        ]
-        
-        try:
-            if progress_callback:
-                progress_callback("Extracting audio...")
-            
-            result = subprocess.run(
-                cmd, 
-                stdout=subprocess.DEVNULL, 
-                stderr=subprocess.PIPE, 
-                check=True, 
-                text=True
-            )
-            
-            success = os.path.exists(audio_path)
-            if progress_callback and success:
-                progress_callback("Audio extraction completed")
-            
-            return success
-            
-        except subprocess.CalledProcessError as e:
-            print(f"FFmpeg error: {e.stderr}", flush=True)
-            return False
-
-    def transcribe_audio(self, audio_path: str, progress_callback=None) -> Optional[Dict[str, Any]]:
-        """Transcribe, align, and diarize audio with progress tracking"""
+    def transcribe_audio_on_device(self, audio_path: str, device_id, progress_callback=None) -> Optional[Dict[str, Any]]:
+        """Transcribe audio trên GPU cụ thể"""
         if not os.path.exists(audio_path):
-            print(f"Audio not found: {audio_path}", flush=True)
             return None
 
+        transcriber = self.transcribers[device_id]
+        device = transcriber['device']
+        
         if progress_callback:
-            progress_callback("Starting transcription...")
+            progress_callback(f"Processing on {device}...")
 
-        # Clear memory before transcription if needed
-        if self.memory_management and MemoryManager.should_clear_memory():
-            if progress_callback:
-                progress_callback("Clearing memory cache...")
-            MemoryManager.clear_all_cache()
+        # Clear memory before transcription
+        if self.memory_management:
+            MemoryManager.clear_all_cache(device_id if isinstance(device_id, int) else None)
 
         try:
-            # Transcribe
-            result = self.model.transcribe(str(audio_path), batch_size=16)
+            # Step 1: Transcription
+            if self.language == "auto":
+                result = transcriber['model'].transcribe(
+                    str(audio_path), 
+                    batch_size=self.batch_size,
+                    language=None
+                )
+                detected_lang = result.get('language', 'en')
+                print(f"Detected language: {detected_lang} on {device}", flush=True)
+                
+                # Load alignment model
+                self.load_alignment_model(device_id, detected_lang)
+            else:
+                result = transcriber['model'].transcribe(
+                    str(audio_path), 
+                    batch_size=self.batch_size,
+                    language=self.language
+                )
+                detected_lang = self.language
+                
+                if transcriber['align_model'] is None:
+                    self.load_alignment_model(device_id, detected_lang)
             
             if progress_callback:
-                progress_callback("Transcription completed, starting alignment...")
+                progress_callback(f"Transcription done on {device}, aligning...")
 
-            # Align words
-            if self.align_model and self.align_metadata:
+            # Step 2: Word alignment
+            if transcriber['align_model'] and transcriber['align_metadata']:
                 try:
                     result = whisperx.align(
                         result["segments"],
-                        self.align_model,
-                        self.align_metadata,
+                        transcriber['align_model'],
+                        transcriber['align_metadata'],
                         str(audio_path),
-                        self.device,
+                        device,
                         return_char_alignments=False
                     )
                     if progress_callback:
-                        progress_callback("Word alignment completed")
+                        progress_callback(f"Alignment done on {device}")
                 except Exception as e:
-                    print(f"Alignment failed: {e}", flush=True)
-                    if progress_callback:
-                        progress_callback("Alignment failed, continuing...")
+                    print(f"Alignment failed on {device}: {e}", flush=True)
 
-            # Diarization
-            if self.diarization_pipeline:
+            # Step 3: Diarization (chỉ trên GPU đầu tiên)
+            if transcriber['diarization_pipeline'] and device_id == self.device_ids[0]:
                 try:
                     if progress_callback:
-                        progress_callback("Performing speaker diarization...")
+                        progress_callback(f"Diarization on {device}...")
                     
-                    diarize_result = self.diarization_pipeline(str(audio_path))
+                    diarize_result = transcriber['diarization_pipeline'](str(audio_path))
                     result = whisperx.assign_word_speakers(diarize_result, result)
                     
                     if progress_callback:
-                        progress_callback("Speaker diarization completed")
+                        progress_callback(f"Diarization done on {device}")
                 except Exception as e:
-                    print(f"Diarization failed: {e}", flush=True)
-                    if progress_callback:
-                        progress_callback("Diarization failed, continuing...")
+                    print(f"Diarization failed on {device}: {e}", flush=True)
 
-            # Clear memory after processing
+            result['detected_language'] = detected_lang
+            result['processed_on_device'] = device
+
+            # Clear memory
             if self.memory_management:
-                MemoryManager.clear_all_cache()
+                MemoryManager.clear_all_cache(device_id if isinstance(device_id, int) else None)
 
             return result
             
         except Exception as e:
-            print(f"Transcription error: {e}", flush=True)
+            print(f"Transcription error on {device}: {e}", flush=True)
             if self.memory_management:
-                MemoryManager.clear_all_cache()
+                MemoryManager.clear_all_cache(device_id if isinstance(device_id, int) else None)
             return None
 
+    def extract_audio(self, video_path: str, audio_path: str) -> bool:
+        """Extract audio from video"""
+        cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            str(audio_path)
+        ]
+        
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+            return os.path.exists(audio_path)
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg error: {e}", flush=True)
+            return False
+
     def process_video(self, video_path: str, progress_callback=None) -> Dict[str, Any]:
-        """Process single video with progress tracking"""
+        """Process single video với load balancing"""
         video_path = Path(video_path)
         video_name = video_path.stem
         tmp_dir = tempfile.mkdtemp()
@@ -260,160 +319,160 @@ class VideoTranscriberX:
             "success": False,
             "error": None,
             "transcription": None,
-            "memory_info": {}
+            "device_used": None
         }
 
-        # Memory info before processing
-        if self.memory_management:
-            result["memory_info"]["before"] = MemoryManager.get_memory_info()
+        # Get available GPU
+        try:
+            device_id = self.gpu_queue.get(timeout=1)
+        except queue.Empty:
+            # Fallback to first GPU if queue empty
+            device_id = self.device_ids[0]
 
         try:
             if progress_callback:
-                progress_callback(f"Processing: {video_name}")
+                progress_callback(f"Processing {video_name} on device {device_id}")
 
             # Extract audio
-            if not self.extract_audio(video_path, audio_path, progress_callback):
+            if not self.extract_audio(video_path, audio_path):
                 result["error"] = "Audio extraction failed"
                 return result
 
             # Transcribe
-            script = self.transcribe_audio(audio_path, progress_callback)
+            script = self.transcribe_audio_on_device(
+                audio_path, 
+                device_id, 
+                progress_callback
+            )
+            
             if script is None:
                 result["error"] = "Transcription failed"
                 return result
 
             result["transcription"] = script
+            result["device_used"] = self.transcribers[device_id]['device']
             result["success"] = True
-            
-            if progress_callback:
-                progress_callback(f"Completed: {video_name}")
 
         except Exception as e:
             result["error"] = str(e)
-            if progress_callback:
-                progress_callback(f"Error processing {video_name}: {str(e)}")
 
         finally:
-            # Clean up temp files
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Return device to queue
+            self.gpu_queue.put(device_id)
             
-            # Memory info after processing
-            if self.memory_management:
-                result["memory_info"]["after"] = MemoryManager.get_memory_info()
-                # Force cleanup after each video
-                MemoryManager.clear_all_cache()
+            # Cleanup
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return result
 
-    def __del__(self):
-        """Cleanup when object is destroyed"""
-        if self.memory_management:
-            MemoryManager.clear_all_cache()
 
-
-def process_video_folder(folder_path: str, output_json: str, model_size="large-v2", 
-                        hf_token=None, memory_management=True) -> None:
-    """Process all videos in folder with progress tracking"""
+def process_video_folder_multi_gpu(folder_path: str, output_json: str, model_size="large-v2",
+                                  hf_token=None, memory_management=True, language="auto",
+                                  max_workers=2) -> None:
+    """Process videos với multi-GPU support"""
+    
     folder_path = Path(folder_path)
-    if not folder_path.exists() or not folder_path.is_dir():
-        print(f"Folder invalid: {folder_path}", flush=True)
+    if not folder_path.exists():
+        print(f"Folder not found: {folder_path}", flush=True)
         return
 
-    # Initialize transcriber
-    print("Initializing transcriber...", flush=True)
-    transcriber = VideoTranscriberX(
-        model_size=model_size, 
+    # Initialize multi-GPU transcriber
+    print("Initializing multi-GPU transcriber for T4x2...", flush=True)
+    transcriber = MultiGPUVideoTranscriberX(
+        model_size=model_size,
         hf_token=hf_token,
-        memory_management=memory_management
+        memory_management=memory_management,
+        language=language
     )
 
-    # Find videos
-    video_extensions = ['*.mp4','*.avi','*.mov','*.mkv','*.wmv','*.flv','*.webm','*.m4v']
+    # Find video files
+    video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.wmv', '*.flv', '*.webm', '*.m4v']
     video_files = []
     for ext in video_extensions:
         video_files.extend(folder_path.rglob(ext))
         video_files.extend(folder_path.rglob(ext.upper()))
+    
     video_files = sorted(list(set(video_files)))
-
+    
     if not video_files:
-        print(f"No video files found in {folder_path}", flush=True)
+        print("No video files found", flush=True)
         return
 
-    print(f"Found {len(video_files)} video files", flush=True)
-    
+    print(f"Found {len(video_files)} videos. Processing with {len(transcriber.device_ids)} devices...", flush=True)
+
     results = []
     
-    # Progress bar for overall progress
-    with tqdm(video_files, desc="Processing videos", unit="video") as pbar:
-        for i, video_path in enumerate(pbar):
-            # Update progress bar description
-            pbar.set_description(f"Processing: {video_path.name}")
-            
-            # Progress callback for individual video steps
-            def progress_callback(message):
-                pbar.set_postfix_str(message)
-            
-            # Process video
-            result = transcriber.process_video(str(video_path), progress_callback)
-            results.append(result)
-            
-            # Update progress bar with status
-            status = "✓" if result["success"] else "✗"
-            pbar.set_postfix_str(f"{status} {video_path.name}")
-            
-            # Memory info in progress bar
-            if memory_management and 'memory_info' in result and 'after' in result['memory_info']:
-                memory_info = result['memory_info']['after']
-                if 'gpu_allocated' in memory_info:
-                    pbar.set_postfix_str(f"{status} GPU: {memory_info['gpu_allocated']:.1f}GB")
-                else:
-                    pbar.set_postfix_str(f"{status} CPU: {memory_info['cpu_percent']:.1f}%")
+    # Process with ThreadPoolExecutor for parallel GPU usage
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(transcriber.device_ids))) as executor:
+        # Submit all tasks
+        future_to_video = {
+            executor.submit(transcriber.process_video, str(video_path)): video_path 
+            for video_path in video_files
+        }
+        
+        # Progress bar
+        with tqdm(total=len(video_files), desc="Processing videos", unit="video") as pbar:
+            for future in as_completed(future_to_video):
+                video_path = future_to_video[future]
+                
+                try:
+                    result = future.result()
+                    results.append(result)
+                    
+                    status = "✓" if result["success"] else "✗"
+                    device_used = result.get("device_used", "unknown")
+                    pbar.set_postfix_str(f"{status} {video_path.name} on {device_used}")
+                    
+                except Exception as e:
+                    error_result = {
+                        "video_path": str(video_path),
+                        "video_name": video_path.stem,
+                        "success": False,
+                        "error": str(e),
+                        "processed_at": datetime.now().isoformat()
+                    }
+                    results.append(error_result)
+                    pbar.set_postfix_str(f"✗ Error: {video_path.name}")
+                
+                pbar.update(1)
 
     # Save results
-    print(f"\nSaving results to {output_json}...", flush=True)
+    print(f"Saving results to {output_json}...", flush=True)
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
-    # Final summary
+    # Summary
     successful = sum(1 for r in results if r["success"])
-    failed = len(results) - successful
-    
-    print(f"\n--- Processing Summary ---", flush=True)
+    print(f"\n=== Multi-GPU Processing Summary ===", flush=True)
     print(f"Total videos: {len(results)}", flush=True)
     print(f"Successful: {successful}", flush=True)
-    print(f"Failed: {failed}", flush=True)
-    print(f"Results saved to: {output_json}", flush=True)
-    
-    if memory_management:
-        final_memory = MemoryManager.get_memory_info()
-        print(f"Final memory usage - CPU: {final_memory['cpu_percent']:.1f}%", flush=True)
-        if 'gpu_allocated' in final_memory:
-            print(f"Final memory usage - GPU: {final_memory['gpu_allocated']:.1f}GB", flush=True)
+    print(f"Failed: {len(results) - successful}", flush=True)
+    print(f"Devices used: {len(transcriber.device_ids)}", flush=True)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Transcribe videos with WhisperX + Memory Management")
-    parser.add_argument("folder_path", help="Path to folder containing videos")
-    parser.add_argument("-o", "--output", default="results.json", help="Output JSON file")
-    parser.add_argument("-m", "--model", default="large-v2", help="WhisperX model size")
-    parser.add_argument("-t", "--token", default=None, help="HuggingFace token for diarization")
-    parser.add_argument("--no-memory-management", action="store_true", 
-                       help="Disable automatic memory management")
+    parser = argparse.ArgumentParser(description="Multi-GPU Video Transcription for T4x2")
+    parser.add_argument("folder_path", help="Path to video folder")
+    parser.add_argument("-o", "--output", default="results.json", help="Output JSON")
+    parser.add_argument("-m", "--model", default="large-v2", help="WhisperX model")
+    parser.add_argument("-t", "--token", help="HuggingFace token")
+    parser.add_argument("-l", "--language", default="auto", help="Language code or 'auto'")
+    parser.add_argument("-w", "--workers", type=int, default=2, help="Max parallel workers")
+    parser.add_argument("--no-memory-management", action="store_true")
     
     args = parser.parse_args()
-
+    
     hf_token = args.token or os.getenv("HF_TOKEN")
-    if not hf_token:
-        print("No HF token provided, diarization disabled", flush=True)
-
     memory_management = not args.no_memory_management
     
-    process_video_folder(
-        args.folder_path, 
-        args.output, 
-        args.model, 
+    process_video_folder_multi_gpu(
+        args.folder_path,
+        args.output,
+        args.model,
         hf_token,
-        memory_management
+        memory_management,
+        args.language,
+        args.workers
     )
