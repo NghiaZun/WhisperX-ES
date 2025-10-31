@@ -8,3 +8,5 @@ ffmpeg-python==0.2.0
 soundfile==0.12.1
 huggingface_hub==0.25.1
 psutil==6.0.0
+tokenizers>=0.21,<0.22
+transformers==4.44.2
