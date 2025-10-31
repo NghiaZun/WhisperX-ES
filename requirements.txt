@@ -1,23 +1,24 @@
-# Core dependencies - specific versions for compatibility
-torch>=2.0.0
-torchaudio>=2.0.0
+# Core
+torch==2.3.1
+torchaudio==2.3.1
+numpy==1.26.4
+tqdm==4.66.5
 
-# Whisper for transcription
-openai-whisper==20231117
+# Whisper + WhisperX
+openai-whisper==20240930
+git+https://github.com/m-bain/whisperX.git
 
-# Video/Audio processing - compatible versions
-moviepy==1.0.3
-librosa==0.10.0
-
-# NumPy - find middle ground
-numpy>=1.20.3,<2.0
-
-# WhisperX - use older compatible version
-# git+https://github.com/m-bain/whisperX.git@v3.1.1
-
-# Additional audio processing
+# Audio processing
 ffmpeg-python==0.2.0
+soundfile==0.12.1
 
-# Basic utilities (built-in, no need to install)
-# pathlib
-# argparse
+# PyAnnote diarization (speaker separation)
+pyannote.audio==3.1.1
+huggingface_hub==0.25.1
+
+# Utils
+psutil==6.0.0
+pathlib==1.0.1
+
+# Optional but useful
+pydub==0.25.1
