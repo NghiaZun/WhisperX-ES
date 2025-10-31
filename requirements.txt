@@ -1,24 +1,10 @@
-# Core
+# requirements.txt (đề xuất)
 torch==2.3.1
 torchaudio==2.3.1
-numpy==1.26.4
 tqdm==4.66.5
-
-# Whisper + WhisperX
-openai-whisper==20240930
-git+https://github.com/m-bain/whisperX.git
-
-# Audio processing
+numpy==2.0.2
+whisperx @ git+https://github.com/m-bain/whisperX.git
 ffmpeg-python==0.2.0
 soundfile==0.12.1
-
-# PyAnnote diarization (speaker separation)
-pyannote.audio==3.1.1
 huggingface_hub==0.25.1
-
-# Utils
 psutil==6.0.0
-pathlib==1.0.1
-
-# Optional but useful
-pydub==0.25.1
